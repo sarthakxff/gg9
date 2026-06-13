@@ -94,7 +94,10 @@ async function checkViaIGData(username) {
     if (err.code === "ECONNABORTED" || err.code === "ETIMEDOUT") {
       return { status: STATUS.ERROR, detail: "IGData: request timed out.", profile: null };
     }
-    return { status: STATUS.ERROR, detail: "IGData: " + err.message, profile: null };
+    if (httpStatus === 502 || httpStatus === 503 || httpStatus === 504) {
+  return { status: STATUS.RATE_LIMITED, detail: "IGData: API temporarily down (HTTP " + httpStatus + "). Will retry.", profile: null };
+}
+return { status: STATUS.ERROR, detail: "IGData: unexpected response HTTP " + httpStatus + ".", profile: null };
   }
 }
 
