@@ -13,7 +13,7 @@ const axios = require("axios");
 const RAPIDAPI_KEY  = process.env.RAPIDAPI_KEY || null;
 const RAPIDAPI_HOST = "instagram-data1.p.rapidapi.com";
 
-const CONFIRMATION_NEEDED = 2;
+const CONFIRMATION_NEEDED = 1;
 
 const STATUS = {
   BANNED:       "BANNED",
