@@ -1,19 +1,17 @@
 /**
- * instagramChecker.js — v8 (instagram-private-api edition)
+ * instagramChecker.js — v9 (IG Data RapidAPI edition)
  *
- * Uses instagram-private-api with username/password login.
- * Works reliably from Railway datacenter IPs — no cookies, no proxy needed.
+ * Uses IG Data API from RapidAPI — free tier, works from Railway.
  *
  * Required env vars:
- *   IG_USERNAME  — Spare Instagram account username
- *   IG_PASSWORD  — Spare Instagram account password
+ *   RAPIDAPI_KEY  — Your RapidAPI key
  */
 
-const { IgApiClient } = require("instagram-private-api");
+const axios = require("axios");
 
 // ── Constants ──────────────────────────────────────────────────────────────
-const IG_USERNAME = process.env.IG_USERNAME || null;
-const IG_PASSWORD = process.env.IG_PASSWORD || null;
+const RAPIDAPI_KEY  = process.env.RAPIDAPI_KEY || null;
+const RAPIDAPI_HOST = "instagram-data1.p.rapidapi.com";
 
 const CONFIRMATION_NEEDED = 2;
 
@@ -26,43 +24,6 @@ const STATUS = {
 
 const confirmationTracker = {};
 
-// ── Instagram client (singleton) ───────────────────────────────────────────
-let igClient = null;
-let isLoggedIn = false;
-let loginInProgress = false;
-
-async function getClient() {
-  if (isLoggedIn && igClient) return igClient;
-  if (loginInProgress) {
-    // Wait for ongoing login to finish
-    await new Promise(resolve => setTimeout(resolve, 5000));
-    return igClient;
-  }
-
-  loginInProgress = true;
-  try {
-    igClient = new IgApiClient();
-    igClient.state.generateDevice(IG_USERNAME);
-
-    console.log("[IG] Logging in as", IG_USERNAME, "...");
-    await igClient.simulate.preLoginFlow();
-    await igClient.account.login(IG_USERNAME, IG_PASSWORD);
-    await igClient.simulate.postLoginFlow();
-
-    isLoggedIn = true;
-    console.log("[IG] Logged in successfully.");
-    return igClient;
-  } catch (err) {
-    isLoggedIn = false;
-    igClient = null;
-    console.error("[IG] Login failed:", err.message);
-    throw err;
-  } finally {
-    loginInProgress = false;
-  }
-}
-
-// ── Utility functions ──────────────────────────────────────────────────────
 function jitter(baseMs) {
   const variance = Math.floor(baseMs * 0.2);
   return Math.max(5000, baseMs + Math.floor(Math.random() * variance * 2) - variance);
@@ -75,70 +36,89 @@ function formatCount(n) {
   return String(n);
 }
 
-// ── Core check via private API ─────────────────────────────────────────────
-async function checkViaPrivateAPI(username) {
-  if (!IG_USERNAME || !IG_PASSWORD) return null;
+// ── IG Data API check ─────────────────────────────────────────────────────
+async function checkViaIGData(username) {
+  if (!RAPIDAPI_KEY) return null;
 
   try {
-    const ig = await getClient();
-    const user = await ig.user.searchExact(username);
+    const resp = await axios.get(
+      "https://instagram-data1.p.rapidapi.com/user/info",
+      {
+        params: { username: username },
+        headers: {
+          "x-rapidapi-key":  RAPIDAPI_KEY,
+          "x-rapidapi-host": RAPIDAPI_HOST,
+        },
+        timeout: 15000,
+        validateStatus: function() { return true; },
+      }
+    );
 
-    if (!user) {
-      return { status: STATUS.BANNED, detail: "Private API: user not found.", profile: null };
+    const httpStatus = resp.status;
+    const data = resp.data;
+
+    console.log("[IGData DEBUG]", httpStatus, JSON.stringify(data).slice(0, 300));
+
+    if (httpStatus === 429) {
+      return { status: STATUS.RATE_LIMITED, detail: "IGData: rate limited (429).", profile: null };
     }
 
-    // Get full info
-    const info = await ig.user.info(user.pk);
+    if (httpStatus === 402) {
+      return { status: STATUS.ERROR, detail: "IGData: quota exceeded — upgrade plan.", profile: null };
+    }
 
-    const profile = {
-      followers:    info.follower_count    || null,
-      following:    info.following_count   || null,
-      posts:        info.media_count       || null,
-      displayName:  info.full_name         || null,
-      profilePicUrl: info.profile_pic_url  || null,
-      isPrivate:    info.is_private        || false,
-    };
+    if (httpStatus === 404 || (data && data.detail && data.detail.includes("not found"))) {
+      return { status: STATUS.BANNED, detail: "IGData: user not found (banned or deleted).", profile: null };
+    }
 
-    console.log("[PrivateAPI] Found user:", username, "followers:", profile.followers);
-    return { status: STATUS.ACCESSIBLE, detail: "Private API: profile accessible.", profile: profile };
+    if (httpStatus === 200 && data && (data.username || data.pk || data.id)) {
+      const profile = {
+        followers:    data.follower_count    || null,
+        following:    data.following_count   || null,
+        posts:        data.media_count       || null,
+        displayName:  data.full_name         || null,
+        profilePicUrl: data.profile_pic_url_hd || data.profile_pic_url || null,
+        isPrivate:    data.is_private        || false,
+      };
+      return { status: STATUS.ACCESSIBLE, detail: "IGData: profile accessible.", profile: profile };
+    }
+
+    // user key is null = banned
+    if (httpStatus === 200 && data && data.user === null) {
+      return { status: STATUS.BANNED, detail: "IGData: user is null (banned or removed).", profile: null };
+    }
+
+    return { status: STATUS.ERROR, detail: "IGData: unexpected response HTTP " + httpStatus + ".", profile: null };
 
   } catch (err) {
-    const msg = err.message || "";
-
-    // User not found = banned/deleted
-    if (msg.includes("User not found") || msg.includes("user_not_found") || err.name === "IgNotFoundError") {
-      return { status: STATUS.BANNED, detail: "Private API: user not found (banned or deleted).", profile: null };
+    if (err.code === "ECONNABORTED" || err.code === "ETIMEDOUT") {
+      return { status: STATUS.ERROR, detail: "IGData: request timed out.", profile: null };
     }
-
-    // Rate limited
-    if (msg.includes("Please wait") || msg.includes("feedback_required") || msg.includes("checkpoint")) {
-      return { status: STATUS.RATE_LIMITED, detail: "Private API: rate limited — waiting.", profile: null };
-    }
-
-    // Session expired — force re-login next call
-    if (msg.includes("login_required") || msg.includes("Not authorized")) {
-      console.warn("[PrivateAPI] Session expired, will re-login on next check.");
-      isLoggedIn = false;
-      igClient = null;
-      return { status: STATUS.ERROR, detail: "Private API: session expired, re-logging in.", profile: null };
-    }
-
-    console.error("[PrivateAPI] Error for", username, ":", msg);
-    return { status: STATUS.ERROR, detail: "Private API: " + msg, profile: null };
+    return { status: STATUS.ERROR, detail: "IGData: " + err.message, profile: null };
   }
 }
 
-// ── Raw check (single attempt, no confirmation logic) ─────────────────────
+// ── Raw check ─────────────────────────────────────────────────────────────
 async function rawCheck(username) {
   const checkedAt = new Date();
 
-  const result = await checkViaPrivateAPI(username);
-
-  if (result) {
-    return Object.assign({}, result, { checkedAt: checkedAt, method: "PrivateAPI" });
+  if (RAPIDAPI_KEY) {
+    const result = await checkViaIGData(username);
+    if (result && result.status !== STATUS.ERROR) {
+      return Object.assign({}, result, { checkedAt: checkedAt, method: "IGData" });
+    }
+    if (result) {
+      console.warn("[rawCheck] IGData failed:", result.detail);
+    }
   }
 
-  return { status: STATUS.ERROR, detail: "No IG credentials configured (set IG_USERNAME and IG_PASSWORD).", profile: null, checkedAt: checkedAt, method: "None" };
+  return {
+    status: STATUS.ERROR,
+    detail: "No RAPIDAPI_KEY set or all methods failed.",
+    profile: null,
+    checkedAt: checkedAt,
+    method: "None",
+  };
 }
 
 // ── Public checkAccount (with confirmation) ───────────────────────────────
@@ -184,15 +164,6 @@ async function checkAccount(username, knownStatus) {
 
 async function checkAccountOnce(username) {
   return rawCheck(username);
-}
-
-// ── Pre-warm login on startup ──────────────────────────────────────────────
-if (IG_USERNAME && IG_PASSWORD) {
-  getClient().catch(err => {
-    console.error("[IG] Startup login failed:", err.message);
-  });
-} else {
-  console.warn("[IG] IG_USERNAME or IG_PASSWORD not set — bot will not work!");
 }
 
 module.exports = { checkAccount, checkAccountOnce, STATUS, jitter, formatCount, CONFIRMATION_NEEDED };
