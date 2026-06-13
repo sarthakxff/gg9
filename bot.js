@@ -176,27 +176,24 @@ async function notifyAccountBanned(username, account) {
   const bannedAt   = new Date(now).toISOString();
   const mentionIds = getAlertMentionIds(account);
   const pings      = mentionIds.map((id) => `<@${id}>`).join(" ");
-  const adderPing  = account.addedById ? `<@${account.addedById}>` : `**${account.addedBy}**`;
   const profile    = account.cachedProfile || null;
   const picUrl     = resolveProfilePic(username, profile?.profilePicUrl);
+  const followers  = profile?.followers != null ? formatCount(profile.followers) : "N/A";
+
+  // Plain message style like the reference screenshot
+  const msgLines = [
+    `${pings}`,
+    ``,
+    `🚫 **Account Banned!** @${username} ❌`,
+    `👥 Followers: ${followers} | ⏱️ Time Taken: ${timeTaken}`,
+  ];
 
   const embed = new EmbedBuilder()
     .setColor(0xff2200)
-    .setTitle("🚨  Target Account Has Been Banned!")
-    .setDescription(`Hey ${adderPing}!\n\nYour target **@${username}** has just been **BANNED / DELETED** from Instagram.`)
-    .setThumbnail(picUrl)
-    .addFields(
-      { name: "🎯 Target Account",    value: `[@${username}](https://instagram.com/${username})`, inline: true  },
-      { name: "👤 Added By",          value: account.addedBy,                                     inline: true  },
-      { name: "🕐 Banned At",         value: tsField(bannedAt),                                   inline: false },
-      { name: "⏱️ Time Taken to Ban", value: timeTaken,                                           inline: true  },
-      { name: "🔢 Total Checks Done", value: account.checkCount.toLocaleString(),                 inline: true  },
-      ...buildProfileFields(profile, "📸 Profile Stats at Time of Ban"),
-    )
-    .setFooter({ text: "Instagram Monitor • Archived to Old Clients automatically" })
-    .setTimestamp();
+    .setImage(picUrl)
+    .setFooter({ text: `Instagram Monitor • ${new Date(bannedAt).toUTCString()}` });
 
-  await channel.send({ content: pings, embeds: [embed], allowedMentions: { users: mentionIds } });
+  await channel.send({ content: msgLines.join("\n"), embeds: [embed], allowedMentions: { users: mentionIds } });
 
   await adminLog({
     type: "ALERT", title: `@${username} — BANNED`, color: 0xff2200,
@@ -221,26 +218,23 @@ async function notifyAccountUnbanned(username, account, freshProfile) {
   const unbannedAt = new Date(now).toISOString();
   const mentionIds = getAlertMentionIds(account);
   const pings      = mentionIds.map((id) => `<@${id}>`).join(" ");
-  const adderPing  = account.addedById ? `<@${account.addedById}>` : `**${account.addedBy}**`;
   const picUrl     = resolveProfilePic(username, freshProfile?.profilePicUrl);
+  const followers  = freshProfile?.followers != null ? formatCount(freshProfile.followers) : "N/A";
+
+  // Plain message style like the reference screenshot
+  const msgLines = [
+    `${pings}`,
+    ``,
+    `🏆 **Account Recovered!** @${username} ✅`,
+    `👥 Followers: ${followers} | ⏱️ Time Taken: ${timeTaken}`,
+  ];
 
   const embed = new EmbedBuilder()
     .setColor(0x00ff88)
-    .setTitle("✅  Client Account Has Been Recovered!")
-    .setDescription(`Hey ${adderPing}!\n\nYour client's account **@${username}** is now **UN-BANNED** and back on Instagram! 🎉`)
-    .setThumbnail(picUrl)
-    .addFields(
-      { name: "🎯 Client Account",      value: `[@${username}](https://instagram.com/${username})`, inline: true  },
-      { name: "👤 Added By",            value: account.addedBy,                                     inline: true  },
-      { name: "🕐 Unbanned At",         value: tsField(unbannedAt),                                 inline: false },
-      { name: "⏱️ Time Taken to Unban", value: timeTaken,                                           inline: true  },
-      { name: "🔢 Total Checks Done",   value: account.checkCount.toLocaleString(),                 inline: true  },
-      ...buildProfileFields(freshProfile, "📸 Current Profile Stats"),
-    )
-    .setFooter({ text: "Instagram Monitor • Archived to Old Clients automatically" })
-    .setTimestamp();
+    .setImage(picUrl)
+    .setFooter({ text: `Instagram Monitor • ${new Date(unbannedAt).toUTCString()}` });
 
-  await channel.send({ content: pings, embeds: [embed], allowedMentions: { users: mentionIds } });
+  await channel.send({ content: msgLines.join("\n"), embeds: [embed], allowedMentions: { users: mentionIds } });
 
   await adminLog({
     type: "ALERT", title: `@${username} — UNBANNED / RECOVERED`, color: 0x00ff88,
