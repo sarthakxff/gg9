@@ -1,41 +1,20 @@
 /**
- * instagramChecker.js --- v7 (Session Cookie edition)
+ * instagramChecker.js — v8 (instagram-private-api edition)
  *
- * Strategy (in order of priority):
- *   1. Instagram private API  --- Uses your own session cookies (rotated).
- *   2. HTML scrape via residential proxy (PROXY_URL) if set.
- *   3. Direct HTML scrape fallback (last resort, often blocked on Railway).
+ * Uses instagram-private-api with username/password login.
+ * Works reliably from Railway datacenter IPs — no cookies, no proxy needed.
  *
  * Required env vars:
- *   IG_COOKIE_1   --- First Instagram session cookie string
- *   IG_COOKIE_2   --- Second Instagram session cookie string (optional but recommended)
- *   PROXY_URL     --- (optional) Residential proxy URL
+ *   IG_USERNAME  — Spare Instagram account username
+ *   IG_PASSWORD  — Spare Instagram account password
  */
 
-const axios = require("axios");
+const { IgApiClient } = require("instagram-private-api");
 
-// ------ Cookie pool ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-const PROXY_URL = process.env.PROXY_URL || null;
+// ── Constants ──────────────────────────────────────────────────────────────
+const IG_USERNAME = process.env.IG_USERNAME || null;
+const IG_PASSWORD = process.env.IG_PASSWORD || null;
 
-const IG_COOKIES = [
-  process.env.IG_COOKIE_1 || null,
-  process.env.IG_COOKIE_2 || null,
-].filter(Boolean);
-
-let cookieIndex = 0;
-function nextCookie() {
-  if (IG_COOKIES.length === 0) return null;
-  const cookie = IG_COOKIES[cookieIndex % IG_COOKIES.length];
-  cookieIndex++;
-  return cookie;
-}
-
-function extractCsrfToken(cookieStr) {
-  const match = cookieStr.match(/csrftoken=([^;]+)/);
-  return match ? match[1] : "missing";
-}
-
-// ------ Constants ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 const CONFIRMATION_NEEDED = 2;
 
 const STATUS = {
@@ -47,16 +26,43 @@ const STATUS = {
 
 const confirmationTracker = {};
 
-const USER_AGENTS = [
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
-  "Mozilla/5.0 (X11; Linux x86_64; rv:125.0) Gecko/20100101 Firefox/125.0",
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
-  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-];
-let uaIndex = 0;
-function nextUA() { return USER_AGENTS[(uaIndex++) % USER_AGENTS.length]; }
+// ── Instagram client (singleton) ───────────────────────────────────────────
+let igClient = null;
+let isLoggedIn = false;
+let loginInProgress = false;
 
+async function getClient() {
+  if (isLoggedIn && igClient) return igClient;
+  if (loginInProgress) {
+    // Wait for ongoing login to finish
+    await new Promise(resolve => setTimeout(resolve, 5000));
+    return igClient;
+  }
+
+  loginInProgress = true;
+  try {
+    igClient = new IgApiClient();
+    igClient.state.generateDevice(IG_USERNAME);
+
+    console.log("[IG] Logging in as", IG_USERNAME, "...");
+    await igClient.simulate.preLoginFlow();
+    await igClient.account.login(IG_USERNAME, IG_PASSWORD);
+    await igClient.simulate.postLoginFlow();
+
+    isLoggedIn = true;
+    console.log("[IG] Logged in successfully.");
+    return igClient;
+  } catch (err) {
+    isLoggedIn = false;
+    igClient = null;
+    console.error("[IG] Login failed:", err.message);
+    throw err;
+  } finally {
+    loginInProgress = false;
+  }
+}
+
+// ── Utility functions ──────────────────────────────────────────────────────
 function jitter(baseMs) {
   const variance = Math.floor(baseMs * 0.2);
   return Math.max(5000, baseMs + Math.floor(Math.random() * variance * 2) - variance);
@@ -69,278 +75,73 @@ function formatCount(n) {
   return String(n);
 }
 
-function parseAbbreviated(str) {
-  if (!str) return null;
-  const clean = str.replace(/,/g, "");
-  if (/B$/i.test(clean)) return Math.round(parseFloat(clean) * 1_000_000_000);
-  if (/M$/i.test(clean)) return Math.round(parseFloat(clean) * 1_000_000);
-  if (/K$/i.test(clean)) return Math.round(parseFloat(clean) * 1_000);
-  return parseInt(clean, 10) || null;
-}
-
-function extractProfileFromHTML(html, username) {
-  const stats = {
-    followers: null, following: null, posts: null,
-    displayName: null, profilePicUrl: null, isPrivate: false,
-  };
-  try {
-    const sharedMatch = html.match(/window\._sharedData\s*=\s*(\{.+?\});<\/script>/s);
-    if (sharedMatch) {
-      const json = JSON.parse(sharedMatch[1]);
-      const user = json && json.entry_data && json.entry_data.ProfilePage &&
-                   json.entry_data.ProfilePage[0] && json.entry_data.ProfilePage[0].graphql &&
-                   json.entry_data.ProfilePage[0].graphql.user;
-      if (user) {
-        stats.followers    = user.edge_followed_by ? user.edge_followed_by.count : null;
-        stats.following    = user.edge_follow ? user.edge_follow.count : null;
-        stats.posts        = user.edge_owner_to_timeline_media ? user.edge_owner_to_timeline_media.count : null;
-        stats.displayName  = user.full_name || null;
-        stats.profilePicUrl = user.profile_pic_url_hd || user.profile_pic_url || null;
-        stats.isPrivate    = user.is_private || false;
-        return stats;
-      }
-    }
-
-    const followersM = html.match(/"edge_followed_by":\{"count":(\d+)/);
-    const followingM = html.match(/"edge_follow":\{"count":(\d+)/);
-    const postsM     = html.match(/"edge_owner_to_timeline_media":\{"count":(\d+)/);
-    const nameM      = html.match(/"full_name":"([^"]+)"/);
-    const picM       = html.match(/"profile_pic_url_hd":"([^"]+)"/);
-    const picFallM   = html.match(/"profile_pic_url":"([^"]+)"/);
-    const privateM   = html.match(/"is_private":(true|false)/);
-
-    if (followersM) stats.followers   = parseInt(followersM[1], 10);
-    if (followingM) stats.following   = parseInt(followingM[1], 10);
-    if (postsM)     stats.posts       = parseInt(postsM[1], 10);
-    if (nameM)      stats.displayName = nameM[1].replace(/\\u([\dA-Fa-f]{4})/g, function(_, h) { return String.fromCharCode(parseInt(h, 16)); });
-    if (picM || picFallM) stats.profilePicUrl = (picM ? picM[1] : picFallM[1]).replace(/\\\//g, "/");
-    if (privateM)   stats.isPrivate   = privateM[1] === "true";
-
-    if (stats.followers !== null) return stats;
-
-    const descM = html.match(/<meta\s+name="description"\s+content="([^"]+)"/i)
-               || html.match(/<meta\s+property="og:description"\s+content="([^"]+)"/i);
-    if (descM) {
-      const desc = descM[1];
-      const fM = desc.match(/([\d,.]+[KMB]?)\s+Followers?/i);
-      const gM = desc.match(/([\d,.]+[KMB]?)\s+Following/i);
-      const pM = desc.match(/([\d,.]+[KMB]?)\s+Posts?/i);
-      if (fM) stats.followers = parseAbbreviated(fM[1]);
-      if (gM) stats.following = parseAbbreviated(gM[1]);
-      if (pM) stats.posts     = parseAbbreviated(pM[1]);
-    }
-    const picMetaM = html.match(/<meta\s+property="og:image"\s+content="([^"]+)"/i);
-    if (picMetaM) stats.profilePicUrl = picMetaM[1];
-    const titleM = html.match(/<meta\s+property="og:title"\s+content="([^"]+)"/i);
-    if (titleM) {
-      const nm = titleM[1].match(/^(.+?)\s*\(@/);
-      if (nm) stats.displayName = nm[1].trim();
-    }
-  } catch (_) {}
-  return stats;
-}
-
-// ------ Instagram private API check (session cookie) ------------------------------------------------------------------------------
-async function checkViaCookie(username) {
-  const cookie = nextCookie();
-  if (!cookie) return null;
-
-  const csrfToken = extractCsrfToken(cookie);
-
-  // Route cookie request through proxy if available (avoids Railway IP blocks)
-  const reqConfig = {
-    params: { username: username },
-    headers: {
-      "User-Agent":       nextUA(),
-      "Cookie":           cookie,
-      "X-CSRFToken":      csrfToken,
-      "X-IG-App-ID":      "936619743392459",
-      "X-Requested-With": "XMLHttpRequest",
-      "Referer":          "https://www.instagram.com/" + username + "/",
-      "Accept":           "application/json",
-      "Accept-Language":  "en-US,en;q=0.9",
-      "Sec-Fetch-Site":   "same-origin",
-      "Sec-Fetch-Mode":   "cors",
-      "Sec-Fetch-Dest":   "empty",
-    },
-    timeout: 15000,
-    validateStatus: function() { return true; },
-  };
-
-  if (PROXY_URL) {
-    reqConfig.proxy = false;
-    try {
-      const HttpsProxyAgent = require("https-proxy-agent").HttpsProxyAgent;
-      reqConfig.httpsAgent = new HttpsProxyAgent(PROXY_URL);
-      console.log("[CookieAPI] Using proxy for request.");
-    } catch (_) {}
-  }
+// ── Core check via private API ─────────────────────────────────────────────
+async function checkViaPrivateAPI(username) {
+  if (!IG_USERNAME || !IG_PASSWORD) return null;
 
   try {
-    const resp = await axios.get(
-      "https://www.instagram.com/api/v1/users/web_profile_info/",
-      reqConfig
-    );
+    const ig = await getClient();
+    const user = await ig.user.searchExact(username);
 
-    const httpStatus = resp.status;
-    const data = resp.data;
-
-    console.log("[CookieAPI DEBUG]", httpStatus, JSON.stringify(data).slice(0, 300));
-
-    if (httpStatus === 429) {
-      return { status: STATUS.RATE_LIMITED, detail: "Cookie API: rate limited (429). Will rotate cookie next call.", profile: null };
+    if (!user) {
+      return { status: STATUS.BANNED, detail: "Private API: user not found.", profile: null };
     }
 
-    if (httpStatus === 401 || httpStatus === 403) {
-      console.warn("[CookieAPI] Auth error " + httpStatus + " --- cookie may be expired.");
-      return { status: STATUS.ERROR, detail: "Cookie API: auth error " + httpStatus + " (cookie expired? re-copy from browser).", profile: null };
-    }
+    // Get full info
+    const info = await ig.user.info(user.pk);
 
-    if (httpStatus === 404) {
-      return { status: STATUS.BANNED, detail: "Cookie API: account not found (404).", profile: null };
-    }
+    const profile = {
+      followers:    info.follower_count    || null,
+      following:    info.following_count   || null,
+      posts:        info.media_count       || null,
+      displayName:  info.full_name         || null,
+      profilePicUrl: info.profile_pic_url  || null,
+      isPrivate:    info.is_private        || false,
+    };
 
-    if (httpStatus === 200 && data && data.data && data.data.user) {
-      const u = data.data.user;
-      const profile = {
-        followers:     u.edge_followed_by ? u.edge_followed_by.count : null,
-        following:     u.edge_follow      ? u.edge_follow.count      : null,
-        posts:         u.edge_owner_to_timeline_media ? u.edge_owner_to_timeline_media.count : null,
-        displayName:   u.full_name        || null,
-        profilePicUrl: u.profile_pic_url_hd || u.profile_pic_url    || null,
-        isPrivate:     u.is_private       || false,
-      };
-      return { status: STATUS.ACCESSIBLE, detail: "Cookie API: profile accessible.", profile: profile };
-    }
-
-    // 200 but user === null  ---  banned/deleted account
-    if (httpStatus === 200 && data && data.data && data.data.user === null) {
-      return { status: STATUS.BANNED, detail: "Cookie API: user is null (account banned or removed).", profile: null };
-    }
-
-    return { status: STATUS.ERROR, detail: "Cookie API: unexpected response (HTTP " + httpStatus + ").", profile: null };
+    console.log("[PrivateAPI] Found user:", username, "followers:", profile.followers);
+    return { status: STATUS.ACCESSIBLE, detail: "Private API: profile accessible.", profile: profile };
 
   } catch (err) {
-    if (err.code === "ECONNABORTED" || err.code === "ETIMEDOUT") {
-      return { status: STATUS.ERROR, detail: "Cookie API: request timed out.", profile: null };
+    const msg = err.message || "";
+
+    // User not found = banned/deleted
+    if (msg.includes("User not found") || msg.includes("user_not_found") || err.name === "IgNotFoundError") {
+      return { status: STATUS.BANNED, detail: "Private API: user not found (banned or deleted).", profile: null };
     }
-    return null;
+
+    // Rate limited
+    if (msg.includes("Please wait") || msg.includes("feedback_required") || msg.includes("checkpoint")) {
+      return { status: STATUS.RATE_LIMITED, detail: "Private API: rate limited — waiting.", profile: null };
+    }
+
+    // Session expired — force re-login next call
+    if (msg.includes("login_required") || msg.includes("Not authorized")) {
+      console.warn("[PrivateAPI] Session expired, will re-login on next check.");
+      isLoggedIn = false;
+      igClient = null;
+      return { status: STATUS.ERROR, detail: "Private API: session expired, re-logging in.", profile: null };
+    }
+
+    console.error("[PrivateAPI] Error for", username, ":", msg);
+    return { status: STATUS.ERROR, detail: "Private API: " + msg, profile: null };
   }
 }
 
-// ------ HTML scrape (direct or via proxy) ---------------------------------------------------------------------------------------------------------------
-async function checkViaHTTP(username, useProxy) {
-  if (useProxy === undefined) useProxy = false;
-  const url = "https://www.instagram.com/" + username + "/";
-  const headers = {
-    "User-Agent": nextUA(),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.5",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Cache-Control": "max-age=0",
-  };
-
-  const axiosConfig = {
-    timeout: 15000,
-    maxRedirects: 3,
-    headers: headers,
-    validateStatus: function() { return true; },
-  };
-
-  if (useProxy && PROXY_URL) {
-    axiosConfig.proxy = false;
-    try {
-      const HttpsProxyAgent = require("https-proxy-agent").HttpsProxyAgent;
-      axiosConfig.httpsAgent = new HttpsProxyAgent(PROXY_URL);
-    } catch (_) {
-      return null;
-    }
-  }
-
-  try {
-    const resp = await axios.get(url, axiosConfig);
-    const httpStatus = resp.status;
-    const data = resp.data;
-
-    if (httpStatus === 429) {
-      return { status: STATUS.RATE_LIMITED, detail: "HTTP: rate limited (429).", profile: null };
-    }
-    if (httpStatus === 404) {
-      return { status: STATUS.BANNED, detail: "HTTP: 404 not found.", profile: null };
-    }
-    if (httpStatus === 200) {
-      const isSorryPage =
-        data.includes("Sorry, this page isn") ||
-        data.includes("isn't available") ||
-        data.includes("page not available") ||
-        data.includes("The link you followed may be broken");
-
-      if (isSorryPage) {
-        return { status: STATUS.BANNED, detail: "HTTP: 'not available' page.", profile: null };
-      }
-
-      const hasProfile =
-        data.includes('"username":"' + username + '"') ||
-        data.includes('/@' + username) ||
-        data.includes('"ProfilePage"') ||
-        data.includes("instagram.com/" + username);
-
-      if (hasProfile) {
-        const profile = extractProfileFromHTML(data, username);
-        return { status: STATUS.ACCESSIBLE, detail: "HTTP: profile page found.", profile: profile };
-      }
-
-      return { status: STATUS.ERROR, detail: "HTTP: ambiguous response (likely soft block).", profile: null };
-    }
-
-    return { status: STATUS.BANNED, detail: "HTTP: unexpected status " + httpStatus + ".", profile: null };
-
-  } catch (err) {
-    if (err.code === "ECONNABORTED" || err.code === "ETIMEDOUT") {
-      return { status: STATUS.ERROR, detail: "HTTP: request timed out.", profile: null };
-    }
-    return { status: STATUS.ERROR, detail: "HTTP: " + err.message, profile: null };
-  }
-}
-
-// ------ Raw check (single attempt, no confirmation logic) ---------------------------------------------------------------
+// ── Raw check (single attempt, no confirmation logic) ─────────────────────
 async function rawCheck(username) {
   const checkedAt = new Date();
 
-  // 1. Session cookie API (primary --- free, no paid API needed)
-  if (IG_COOKIES.length > 0) {
-    const result = await checkViaCookie(username);
-    if (result && result.status !== STATUS.ERROR && result.status !== STATUS.RATE_LIMITED) {
-      return Object.assign({}, result, { checkedAt: checkedAt, method: "CookieAPI" });
-    }
-    if (result) {
-      console.warn("[rawCheck] Cookie method failed, falling back. Detail:", result.detail);
-    }
+  const result = await checkViaPrivateAPI(username);
+
+  if (result) {
+    return Object.assign({}, result, { checkedAt: checkedAt, method: "PrivateAPI" });
   }
 
-  // 2. Residential proxy HTML scrape
-  if (PROXY_URL) {
-    const result = await checkViaHTTP(username, true);
-    if (result && result.status !== STATUS.ERROR) {
-      return Object.assign({}, result, { checkedAt: checkedAt, method: "Proxy" });
-    }
-  }
-
-  // 3. Direct HTML scrape (last resort)
-  const result = await checkViaHTTP(username, false);
-  return Object.assign(
-    {},
-    result || { status: STATUS.ERROR, detail: "All methods failed.", profile: null },
-    { checkedAt: checkedAt, method: "Direct" }
-  );
+  return { status: STATUS.ERROR, detail: "No IG credentials configured (set IG_USERNAME and IG_PASSWORD).", profile: null, checkedAt: checkedAt, method: "None" };
 }
 
-// ------ Public checkAccount (with confirmation) ---------------------------------------------------------------------------------------------
+// ── Public checkAccount (with confirmation) ───────────────────────────────
 async function checkAccount(username, knownStatus) {
   if (knownStatus === undefined) knownStatus = null;
   const raw = await rawCheck(username);
@@ -383,6 +184,15 @@ async function checkAccount(username, knownStatus) {
 
 async function checkAccountOnce(username) {
   return rawCheck(username);
+}
+
+// ── Pre-warm login on startup ──────────────────────────────────────────────
+if (IG_USERNAME && IG_PASSWORD) {
+  getClient().catch(err => {
+    console.error("[IG] Startup login failed:", err.message);
+  });
+} else {
+  console.warn("[IG] IG_USERNAME or IG_PASSWORD not set — bot will not work!");
 }
 
 module.exports = { checkAccount, checkAccountOnce, STATUS, jitter, formatCount, CONFIRMATION_NEEDED };
