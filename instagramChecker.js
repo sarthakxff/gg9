@@ -1,17 +1,17 @@
 /**
- * instagramChecker.js — v9 (IG Data RapidAPI edition)
+ * instagramChecker.js — v10 (Self-hosted API edition)
  *
- * Uses IG Data API from RapidAPI — free tier, works from Railway.
+ * Calls your own Instagram check API hosted on Render.com.
  *
- * Required env vars:
- *   RAPIDAPI_KEY  — Your RapidAPI key
+ * Required env vars (in Railway):
+ *   IG_API_URL     — Your Render API URL e.g. https://your-app.onrender.com
+ *   IG_API_SECRET  — Same secret you set in Render (API_SECRET)
  */
 
 const axios = require("axios");
 
-// ── Constants ──────────────────────────────────────────────────────────────
-const RAPIDAPI_KEY  = process.env.RAPIDAPI_KEY || null;
-const RAPIDAPI_HOST = "instagram-data1.p.rapidapi.com";
+const IG_API_URL    = process.env.IG_API_URL    || null;
+const IG_API_SECRET = process.env.IG_API_SECRET || null;
 
 const CONFIRMATION_NEEDED = 1;
 
@@ -36,68 +36,52 @@ function formatCount(n) {
   return String(n);
 }
 
-// ── IG Data API check ─────────────────────────────────────────────────────
-async function checkViaIGData(username) {
-  if (!RAPIDAPI_KEY) return null;
+// ── Call your self-hosted API ──────────────────────────────────────────────
+async function checkViaOwnAPI(username) {
+  if (!IG_API_URL) return null;
 
   try {
+    const headers = {};
+    if (IG_API_SECRET) headers["x-api-secret"] = IG_API_SECRET;
+
     const resp = await axios.get(
-      "https://instagram-data1.p.rapidapi.com/user/info",
+      `${IG_API_URL}/check`,
       {
-        params: { username: username },
-        headers: {
-          "x-rapidapi-key":  RAPIDAPI_KEY,
-          "x-rapidapi-host": RAPIDAPI_HOST,
-        },
-        timeout: 15000,
-        validateStatus: function() { return true; },
+        params: { username },
+        headers,
+        timeout: 20000,
+        validateStatus: () => true,
       }
     );
 
     const httpStatus = resp.status;
-    const data = resp.data;
+    const data       = resp.data;
 
-    console.log("[IGData DEBUG]", httpStatus, JSON.stringify(data).slice(0, 300));
+    console.log("[OwnAPI DEBUG]", httpStatus, JSON.stringify(data).slice(0, 200));
 
-    if (httpStatus === 429) {
-      return { status: STATUS.RATE_LIMITED, detail: "IGData: rate limited (429).", profile: null };
+    if (httpStatus === 401) {
+      return { status: STATUS.ERROR, detail: "OwnAPI: unauthorized — check IG_API_SECRET.", profile: null };
     }
 
-    if (httpStatus === 402) {
-      return { status: STATUS.ERROR, detail: "IGData: quota exceeded — upgrade plan.", profile: null };
+    if (httpStatus === 200 && data.status === "ACCESSIBLE") {
+      return { status: STATUS.ACCESSIBLE, detail: "OwnAPI: profile accessible.", profile: data.profile || null };
     }
 
-    if (httpStatus === 404 || (data && data.detail && data.detail.includes("not found"))) {
-      return { status: STATUS.BANNED, detail: "IGData: user not found (banned or deleted).", profile: null };
+    if (httpStatus === 200 && data.status === "BANNED") {
+      return { status: STATUS.BANNED, detail: "OwnAPI: account banned or not found.", profile: null };
     }
 
-    if (httpStatus === 200 && data && (data.username || data.pk || data.id)) {
-      const profile = {
-        followers:    data.follower_count    || null,
-        following:    data.following_count   || null,
-        posts:        data.media_count       || null,
-        displayName:  data.full_name         || null,
-        profilePicUrl: data.profile_pic_url_hd || data.profile_pic_url || null,
-        isPrivate:    data.is_private        || false,
-      };
-      return { status: STATUS.ACCESSIBLE, detail: "IGData: profile accessible.", profile: profile };
+    if (httpStatus === 200 && data.status === "RATE_LIMITED") {
+      return { status: STATUS.RATE_LIMITED, detail: "OwnAPI: all accounts rate limited.", profile: null };
     }
 
-    // user key is null = banned
-    if (httpStatus === 200 && data && data.user === null) {
-      return { status: STATUS.BANNED, detail: "IGData: user is null (banned or removed).", profile: null };
-    }
-
-    return { status: STATUS.ERROR, detail: "IGData: unexpected response HTTP " + httpStatus + ".", profile: null };
+    return { status: STATUS.ERROR, detail: "OwnAPI: unexpected response HTTP " + httpStatus + ".", profile: null };
 
   } catch (err) {
     if (err.code === "ECONNABORTED" || err.code === "ETIMEDOUT") {
-      return { status: STATUS.ERROR, detail: "IGData: request timed out.", profile: null };
+      return { status: STATUS.ERROR, detail: "OwnAPI: request timed out.", profile: null };
     }
-    if (httpStatus === 502 || httpStatus === 503 || httpStatus === 504) {
-  return { status: STATUS.RATE_LIMITED, detail: "IGData: API temporarily down (HTTP " + httpStatus + "). Will retry.", profile: null };
-}
-return { status: STATUS.ERROR, detail: "IGData: unexpected response HTTP " + httpStatus + ".", profile: null };
+    return { status: STATUS.ERROR, detail: "OwnAPI: " + err.message, profile: null };
   }
 }
 
@@ -105,23 +89,16 @@ return { status: STATUS.ERROR, detail: "IGData: unexpected response HTTP " + htt
 async function rawCheck(username) {
   const checkedAt = new Date();
 
-  if (RAPIDAPI_KEY) {
-    const result = await checkViaIGData(username);
-    if (result && result.status !== STATUS.ERROR) {
-      return Object.assign({}, result, { checkedAt: checkedAt, method: "IGData" });
-    }
-    if (result) {
-      console.warn("[rawCheck] IGData failed:", result.detail);
-    }
+  if (!IG_API_URL) {
+    return { status: STATUS.ERROR, detail: "IG_API_URL not set in Railway env vars.", profile: null, checkedAt, method: "None" };
   }
 
-  return {
-    status: STATUS.ERROR,
-    detail: "No RAPIDAPI_KEY set or all methods failed.",
-    profile: null,
-    checkedAt: checkedAt,
-    method: "None",
-  };
+  const result = await checkViaOwnAPI(username);
+  return Object.assign(
+    {},
+    result || { status: STATUS.ERROR, detail: "API call failed.", profile: null },
+    { checkedAt, method: "OwnAPI" }
+  );
 }
 
 // ── Public checkAccount (with confirmation) ───────────────────────────────
@@ -153,13 +130,11 @@ async function checkAccount(username, knownStatus) {
   confirmationTracker[username] = tracker;
 
   const confirmed = tracker.count >= CONFIRMATION_NEEDED;
-  if (confirmed) {
-    delete confirmationTracker[username];
-  }
+  if (confirmed) delete confirmationTracker[username];
 
   return Object.assign({}, raw, {
     profile: tracker.lastProfile,
-    confirmed: confirmed,
+    confirmed,
     confirmCount: tracker.count,
     confirmNeeded: CONFIRMATION_NEEDED,
   });
