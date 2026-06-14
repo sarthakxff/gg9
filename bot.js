@@ -225,7 +225,7 @@ async function notifyAccountUnbanned(username, account, freshProfile) {
   const msgLines = [
     `${pings}`,
     ``,
-    `🏆 **Account Recovered!** @${username} ✅`,
+    ` **Account Recovered!** @${username} 🏆✅`,
     `👥 Followers: ${followers} | ⏱️ Time Taken: ${timeTaken}`,
   ];
 
