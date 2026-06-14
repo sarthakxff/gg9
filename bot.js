@@ -190,7 +190,7 @@ async function notifyAccountBanned(username, account) {
 
   const embed = new EmbedBuilder()
     .setColor(0xff2200)
-    .setImage(picUrl)
+    .setThumbnail(picUrl)
     .setFooter({ text: `Instagram Monitor • ${new Date(bannedAt).toUTCString()}` });
 
   await channel.send({ content: msgLines.join("\n"), embeds: [embed], allowedMentions: { users: mentionIds } });
@@ -225,13 +225,13 @@ async function notifyAccountUnbanned(username, account, freshProfile) {
   const msgLines = [
     `${pings}`,
     ``,
-    ` **Account Recovered!** @${username} 🏆✅`,
+    `🏆 **Account Recovered!** @${username} ✅`,
     `👥 Followers: ${followers} | ⏱️ Time Taken: ${timeTaken}`,
   ];
 
   const embed = new EmbedBuilder()
     .setColor(0x00ff88)
-    .setImage(picUrl)
+    .setThumbnail(picUrl)
     .setFooter({ text: `Instagram Monitor • ${new Date(unbannedAt).toUTCString()}` });
 
   await channel.send({ content: msgLines.join("\n"), embeds: [embed], allowedMentions: { users: mentionIds } });
