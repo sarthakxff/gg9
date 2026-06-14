@@ -1,25 +1,5 @@
 /**
- * bot.js — Instagram Account Monitor (v6)
- *
- * Key changes from v5:
- *   • CHECK interval: 2 minutes per account (120 000 ms) — no more false positives
- *     from too-fast polling that triggers Instagram rate limits.
- *   • 10-account maximum (was 200 — unrealistic).
- *   • Confirmation system: status must appear 3× in a row before triggering
- *     an alert. This kills false ban/unban notifications from ambiguous responses.
- *   • Staggered starts: accounts don't all fire at the same second.
- *   • Better rate-limit handling: backs off per-account independently.
- *   • /monitor status uses a one-shot check (no confirmation needed).
- *   • Confirmation progress shown in console so you can see it working.
- *
- * Commands:
- *   /help
- *   /monitor add <username>
- *   /monitor list
- *   /monitor status <username>
- *   /monitor remove <username>
- *   /monitor grant <user>
- *   /monitor revoke <user>
+ * bot.js — Instagram Account Monitor (v9)
  */
 
 require("dotenv").config();
@@ -42,17 +22,15 @@ for (const key of REQUIRED_ENV) {
 if (!process.env.LOG_CHANNEL_ID || process.env.LOG_CHANNEL_ID.includes("your_")) {
   console.warn("⚠️  LOG_CHANNEL_ID not set — admin activity logging is disabled.");
 }
-if (!(process.env.IG_COOKIE_1 || process.env.IG_COOKIE_2)) {
-  console.warn("⚠️  No IG_COOKIE_1 or IG_COOKIE_2 set — falling back to HTML scraping only (less reliable on Railway).");
+if (!process.env.RAPIDAPI_KEY) {
+  console.warn("⚠️  RAPIDAPI_KEY not set — bot will not work!");
 }
 
-const TOKEN           = process.env.DISCORD_TOKEN;
-const CHANNEL_ID      = process.env.DISCORD_CHANNEL_ID;
-const GUILD_ID        = process.env.DISCORD_GUILD_ID;
-const LOG_CHANNEL_ID  = process.env.LOG_CHANNEL_ID || null;
+const TOKEN          = process.env.DISCORD_TOKEN;
+const CHANNEL_ID     = process.env.DISCORD_CHANNEL_ID;
+const GUILD_ID       = process.env.DISCORD_GUILD_ID;
+const LOG_CHANNEL_ID = process.env.LOG_CHANNEL_ID || null;
 
-// 2-minute base interval. Each account also gets a random stagger offset
-// so they don't all fire simultaneously and hammer the API together.
 const BASE_INTERVAL_MS = parseInt(process.env.CHECK_INTERVAL_MS || "120000", 10);
 
 // ── Discord client ─────────────────────────────────────────────────────────
@@ -98,8 +76,8 @@ async function adminLog({ type, title, description, color, user, guild, fields =
   const logChannel = await client.channels.fetch(LOG_CHANNEL_ID).catch(() => null);
   if (!logChannel) return;
 
-  const typeColors  = { COMMAND: 0x5865f2, BOT_RESPONSE: 0x36393f, ALERT: 0xff9900, SYSTEM: 0x888888 };
-  const typeLabels  = { COMMAND: "📥 USER COMMAND", BOT_RESPONSE: "📤 BOT RESPONSE", ALERT: "🔔 ALERT SENT", SYSTEM: "⚙️ SYSTEM" };
+  const typeColors = { COMMAND: 0x5865f2, BOT_RESPONSE: 0x36393f, ALERT: 0xff9900, SYSTEM: 0x888888 };
+  const typeLabels = { COMMAND: "📥 USER COMMAND", BOT_RESPONSE: "📤 BOT RESPONSE", ALERT: "🔔 ALERT SENT", SYSTEM: "⚙️ SYSTEM" };
 
   const embed = new EmbedBuilder()
     .setColor(color ?? typeColors[type] ?? 0x888888)
@@ -155,7 +133,7 @@ function resolveProfilePic(username, scrapedUrl) {
 
 function buildProfileFields(profile, label = "📸 Last Known Profile Stats") {
   if (!profile || (profile.followers === null && profile.following === null)) {
-    return [{ name: label, value: "_Stats unavailable — Instagram did not expose public data._", inline: false }];
+    return [{ name: label, value: "_Stats unavailable._", inline: false }];
   }
   const lines = [];
   if (profile.displayName) lines.push(`**Name:** ${profile.displayName}`);
@@ -180,7 +158,6 @@ async function notifyAccountBanned(username, account) {
   const picUrl     = resolveProfilePic(username, profile?.profilePicUrl);
   const followers  = profile?.followers != null ? formatCount(profile.followers) : "N/A";
 
-  // Plain message style like the reference screenshot
   const msgLines = [
     `${pings}`,
     ``,
@@ -221,7 +198,6 @@ async function notifyAccountUnbanned(username, account, freshProfile) {
   const picUrl     = resolveProfilePic(username, freshProfile?.profilePicUrl);
   const followers  = freshProfile?.followers != null ? formatCount(freshProfile.followers) : "N/A";
 
-  // Plain message style like the reference screenshot
   const msgLines = [
     `${pings}`,
     ``,
@@ -269,8 +245,8 @@ function archiveAndStop(username, reason) {
 }
 
 // ── Monitor loop ───────────────────────────────────────────────────────────
-const activeTimers   = {};   // username → setTimeout handle
-const backoffTimers  = {};   // username → per-account backoff ms (resets after success)
+const activeTimers  = {};
+const backoffTimers = {};
 
 async function scheduleCheck(username, initialDelayMs = 0) {
   const account = monitoringBase.get(username);
@@ -284,7 +260,6 @@ async function scheduleCheck(username, initialDelayMs = 0) {
     const prev = monitoringBase.get(username);
     if (!prev || !prev.active) return;
 
-    // Pass current known status so confirmation logic knows what "changed" means
     const result = await checkAccount(username, prev.lastStatus);
 
     const updates = {
@@ -292,9 +267,8 @@ async function scheduleCheck(username, initialDelayMs = 0) {
       checkCount:  (prev.checkCount || 0) + 1,
     };
 
-    // ── Rate limited ────────────────────────────────────────────────────────
     if (result.status === STATUS.RATE_LIMITED) {
-      const backoff = Math.min((backoffTimers[username] || BASE_INTERVAL_MS) * 2, 10 * 60 * 1000); // max 10 min
+      const backoff = Math.min((backoffTimers[username] || BASE_INTERVAL_MS) * 2, 10 * 60 * 1000);
       backoffTimers[username] = backoff;
       console.warn(`⚠️  [${username}] Rate limited. Backing off to ${Math.round(backoff / 1000)}s.`);
       monitoringBase.update(username, updates);
@@ -302,7 +276,6 @@ async function scheduleCheck(username, initialDelayMs = 0) {
       return;
     }
 
-    // ── Error: keep same interval, don't update lastStatus ─────────────────
     if (result.status === STATUS.ERROR) {
       console.warn(`⚠️  [${username}] Check error: ${result.detail}`);
       monitoringBase.update(username, updates);
@@ -310,10 +283,7 @@ async function scheduleCheck(username, initialDelayMs = 0) {
       return;
     }
 
-    // Success — reset backoff
     backoffTimers[username] = BASE_INTERVAL_MS;
-
-    // Update status + cache profile if accessible
     updates.lastStatus = result.status;
     if (result.status === STATUS.ACCESSIBLE && result.profile) {
       updates.cachedProfile = result.profile;
@@ -322,21 +292,12 @@ async function scheduleCheck(username, initialDelayMs = 0) {
 
     const methodTag = result.method ? ` [${result.method}]` : "";
 
-    // ── Confirmation progress log ───────────────────────────────────────────
     if (!result.confirmed && result.confirmCount) {
-      console.log(
-        `[${new Date().toLocaleTimeString()}] @${username} (${prev.mode})${methodTag}` +
-        ` → ${result.status} ` +
-        `(confirming: ${result.confirmCount}/${CONFIRMATION_NEEDED})`
-      );
+      console.log(`[${new Date().toLocaleTimeString()}] @${username} (${prev.mode})${methodTag} → ${result.status} (confirming: ${result.confirmCount}/${CONFIRMATION_NEEDED})`);
     } else {
-      console.log(
-        `[${new Date().toLocaleTimeString()}] @${username} (${prev.mode})${methodTag}` +
-        ` → ${result.status}`
-      );
+      console.log(`[${new Date().toLocaleTimeString()}] @${username} (${prev.mode})${methodTag} → ${result.status}`);
     }
 
-    // ── Only act on CONFIRMED status changes ────────────────────────────────
     if (!result.confirmed) {
       scheduleCheck(username);
       return;
@@ -344,29 +305,18 @@ async function scheduleCheck(username, initialDelayMs = 0) {
 
     const updated = monitoringBase.get(username);
 
-    // LIVE → BANNED
     if (updated.mode === "WATCH_FOR_BAN" && result.status === STATUS.BANNED) {
       console.log(`🚨  @${username} CONFIRMED BANNED after ${CONFIRMATION_NEEDED} checks. Alerting...`);
-      monitoringBase.update(username, {
-        active: false,
-        eventDetectedAt: result.checkedAt.toISOString(),
-        lastStatus: STATUS.BANNED,
-      });
+      monitoringBase.update(username, { active: false, eventDetectedAt: result.checkedAt.toISOString(), lastStatus: STATUS.BANNED });
       const finalRecord = monitoringBase.get(username);
       archiveRecord(finalRecord, "BAN_DETECTED");
       await notifyAccountBanned(username, finalRecord);
       return;
     }
 
-    // BANNED → ACCESSIBLE
     if (updated.mode === "WATCH_FOR_UNBAN" && result.status === STATUS.ACCESSIBLE) {
       console.log(`✅  @${username} CONFIRMED UNBANNED after ${CONFIRMATION_NEEDED} checks. Alerting...`);
-      monitoringBase.update(username, {
-        active: false,
-        eventDetectedAt: result.checkedAt.toISOString(),
-        lastStatus: STATUS.ACCESSIBLE,
-        cachedProfile: result.profile,
-      });
+      monitoringBase.update(username, { active: false, eventDetectedAt: result.checkedAt.toISOString(), lastStatus: STATUS.ACCESSIBLE, cachedProfile: result.profile });
       const finalRecord = monitoringBase.get(username);
       archiveRecord(finalRecord, "UNBAN_DETECTED");
       await notifyAccountUnbanned(username, finalRecord, result.profile);
@@ -399,9 +349,6 @@ function resumeAll() {
   }
 
   console.log(`▶️  Resuming monitoring for: ${active.join(", ")}`);
-
-  // Stagger starts: each account fires STAGGER_MS apart so they don't all
-  // hit Instagram at the same second.
   const STAGGER_MS = Math.floor(BASE_INTERVAL_MS / (active.length + 1));
   active.forEach((username, i) => {
     const delay = (i + 1) * STAGGER_MS;
@@ -410,8 +357,7 @@ function resumeAll() {
   });
 
   adminLog({
-    type: "SYSTEM",
-    title: "Bot Restarted — Monitoring Resumed",
+    type: "SYSTEM", title: "Bot Restarted — Monitoring Resumed",
     description:
       `Resumed monitoring for **${active.length}** account(s): ` +
       active.map((u) => `\`@${u}\``).join(", ") +
@@ -427,66 +373,23 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
   const { commandName } = interaction;
 
-  // ── /help ──────────────────────────────────────────────────────────────
   if (commandName === "help") {
     const checkMins = Math.round(BASE_INTERVAL_MS / 60000);
     const embed = new EmbedBuilder()
       .setColor(0x5865f2)
       .setTitle("📖  Instagram Monitor — Help")
-      .setDescription(
-        "This bot monitors Instagram accounts and alerts you the moment they get **banned** or **unbanned**.\n" +
-        "Simply add an account and the bot handles everything automatically."
-      )
+      .setDescription("This bot monitors Instagram accounts and alerts you the moment they get **banned** or **unbanned**.\nSimply add an account and the bot handles everything automatically.")
       .addFields(
-        {
-          name: "➕  `/monitor add <username>`",
-          value:
-            "Add an Instagram account to monitor.\n" +
-            "• If the account is **live**, the bot watches for it getting banned/deleted.\n" +
-            "• If the account is **already banned**, the bot watches for it coming back.\n" +
-            "_The bot auto-detects which mode to use — just add the username._",
-        },
-        {
-          name: "📋  `/monitor list`",
-          value: "Shows all accounts currently being monitored — status, who added them, and how long they've been watched.",
-        },
-        {
-          name: "🔍  `/monitor status <username>`",
-          value: "Runs an immediate live check right now and shows current status, profile stats, and check history.",
-        },
-        {
-          name: "🗑️  `/monitor remove <username>`",
-          value: "Stops monitoring an account and moves it to the archived Old Clients database.",
-        },
-        {
-          name: "⚙️  Bot Settings",
-          value:
-            `• Check interval: **every ~${checkMins} minute${checkMins === 1 ? "" : "s"}**\n` +
-            `• Max accounts: **${MAX_ACTIVE}**\n` +
-            `• Confirmations before alert: **${CONFIRMATION_NEEDED} consecutive checks**\n` +
-            "• False positives are prevented — a status must be confirmed multiple times.",
-        },
-        {
-          name: "🔔  How notifications work",
-          value:
-            "When a **ban** or **unban** is confirmed, an alert is sent that includes:\n" +
-            "• Exact time of the event\n" +
-            "• How long it took from when you added it\n" +
-            "• Follower, following, and post counts\n" +
-            "• Profile picture",
-        },
+        { name: "➕  `/monitor add <username>`", value: "Add an Instagram account to monitor.\n• If the account is **live**, the bot watches for it getting banned/deleted.\n• If the account is **already banned**, the bot watches for it coming back." },
+        { name: "📋  `/monitor list`", value: "Shows all accounts currently being monitored." },
+        { name: "🔍  `/monitor status <username>`", value: "Runs an immediate live check and shows current status." },
+        { name: "🗑️  `/monitor remove <username>`", value: "Stops monitoring an account." },
+        { name: "⚙️  Bot Settings", value: `• Check interval: **every ~${checkMins} minute${checkMins === 1 ? "" : "s"}**\n• Max accounts: **${MAX_ACTIVE}**\n• Confirmations before alert: **${CONFIRMATION_NEEDED}×**` },
       )
-      .setFooter({ text: `Instagram Monitor v6 • /monitor add <username> to get started` })
+      .setFooter({ text: `Instagram Monitor v9 • /monitor add <username> to get started` })
       .setTimestamp();
 
-    await adminLog({
-      type: "COMMAND", title: "/help",
-      description: `<@${interaction.user.id}> used \`/help\``,
-      user: interaction.user,
-      guild: `${interaction.guild?.name ?? "DM"} | #${interaction.channel?.name ?? "unknown"}`,
-    });
-
-    return interaction.reply({ embeds: [embed], ephemeral: true });
+    return interaction.reply({ embeds: [embed], flags: 64 });
   }
 
   if (commandName !== "monitor") return;
@@ -496,64 +399,44 @@ client.on(Events.InteractionCreate, async (interaction) => {
   const username = rawUser.toLowerCase().replace(/^@/, "");
   const logCtx   = `${interaction.guild?.name ?? "DM"} | #${interaction.channel?.name ?? "unknown"}`;
 
-  // ── /monitor grant ─────────────────────────────────────────────────────
   if (sub === "grant") {
     const perms = permissions.load();
     if (!perms.ownerId) {
       permissions.setOwner(interaction.user.id);
     } else if (!permissions.isOwner(interaction.user.id)) {
-      await adminLog({ type: "COMMAND", title: "/monitor grant — DENIED", color: 0xff4444,
-        description: `<@${interaction.user.id}> tried to grant access but is not the owner.`,
-        user: interaction.user, guild: logCtx });
-      return interaction.reply({ content: "❌ Only the **owner** can grant access.", ephemeral: true });
+      return interaction.reply({ content: "❌ Only the **owner** can grant access.", flags: 64 });
     }
     const target = interaction.options.getUser("user");
     permissions.grantAccess(target.id);
-    await adminLog({ type: "COMMAND", title: "/monitor grant",
-      description: `<@${interaction.user.id}> granted access to <@${target.id}> (\`${target.tag}\`).`,
-      user: interaction.user, guild: logCtx });
-    return interaction.reply({ content: `✅ **${target.tag}** can now use \`/monitor list\` and will be pinged on all alerts.`, ephemeral: true });
+    return interaction.reply({ content: `✅ **${target.tag}** can now use \`/monitor list\` and will be pinged on all alerts.`, flags: 64 });
   }
 
-  // ── /monitor revoke ────────────────────────────────────────────────────
   if (sub === "revoke") {
     if (!permissions.isOwner(interaction.user.id)) {
-      await adminLog({ type: "COMMAND", title: "/monitor revoke — DENIED", color: 0xff4444,
-        description: `<@${interaction.user.id}> tried to revoke access but is not the owner.`,
-        user: interaction.user, guild: logCtx });
-      return interaction.reply({ content: "❌ Only the **owner** can revoke access.", ephemeral: true });
+      return interaction.reply({ content: "❌ Only the **owner** can revoke access.", flags: 64 });
     }
     const target = interaction.options.getUser("user");
     permissions.revokeAccess(target.id);
-    await adminLog({ type: "COMMAND", title: "/monitor revoke",
-      description: `<@${interaction.user.id}> revoked access from <@${target.id}>.`,
-      user: interaction.user, guild: logCtx });
-    return interaction.reply({ content: `🚫 **${target.tag}** no longer has access.`, ephemeral: true });
+    return interaction.reply({ content: `🚫 **${target.tag}** no longer has access.`, flags: 64 });
   }
 
-  // ── /monitor add ───────────────────────────────────────────────────────
   if (sub === "add") {
     if (!validateUsername(username)) {
-      return interaction.reply({ content: "❌ Invalid Instagram username. Use only letters, numbers, `.` and `_`.", ephemeral: true });
+      return interaction.reply({ content: "❌ Invalid Instagram username. Use only letters, numbers, `.` and `_`.", flags: 64 });
     }
     if (monitoringBase.get(username)?.active) {
-      return interaction.reply({ content: `⚠️ **@${username}** is already being monitored.`, ephemeral: true });
+      return interaction.reply({ content: `⚠️ **@${username}** is already being monitored.`, flags: 64 });
     }
     if (monitoringBase.activeCount() >= MAX_ACTIVE) {
-      return interaction.reply({ content: `❌ Monitoring Base is full (${MAX_ACTIVE} slots max). Remove an account first.`, ephemeral: true });
+      return interaction.reply({ content: `❌ Monitoring Base is full (${MAX_ACTIVE} slots max). Remove an account first.`, flags: 64 });
     }
 
-    await interaction.deferReply({ ephemeral: true });
+    await interaction.deferReply({ flags: 64 });
 
-    // Use one-shot check for the initial add (no confirmation needed)
     const firstCheck = await checkAccountOnce(username);
     const mode       = firstCheck.status === STATUS.ACCESSIBLE ? "WATCH_FOR_BAN" : "WATCH_FOR_UNBAN";
 
-    const added = monitoringBase.add(
-      username, interaction.user.tag, interaction.user.id,
-      mode, firstCheck.status === STATUS.ACCESSIBLE ? "ACCESSIBLE" : "BANNED"
-    );
-
+    const added = monitoringBase.add(username, interaction.user.tag, interaction.user.id, mode, firstCheck.status === STATUS.ACCESSIBLE ? "ACCESSIBLE" : "BANNED");
     if (!added.ok) {
       if (added.reason === "already_monitored") return interaction.editReply({ content: `⚠️ **@${username}** is already being monitored.` });
       if (added.reason === "max_reached")       return interaction.editReply({ content: `❌ Monitoring Base is full (${MAX_ACTIVE} slots).` });
@@ -570,9 +453,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     const picUrl   = resolveProfilePic(username, firstCheck.profile?.profilePicUrl);
     const checkMin = Math.round(BASE_INTERVAL_MS / 60000);
-    const modeText = mode === "WATCH_FOR_BAN"
-      ? "Account is **LIVE** — watching for ban/deletion"
-      : "Account is **BANNED** — watching for recovery/unban";
 
     let embed;
     if (mode === "WATCH_FOR_BAN") {
@@ -580,11 +460,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         .setColor(0x00cc55)
         .setTitle("🟢  Account Is Live — Monitoring for Ban")
         .setThumbnail(picUrl)
-        .setDescription(
-          `**@${username}** is currently **LIVE** on Instagram.\n\n` +
-          `You'll be notified the moment this account gets **banned or deactivated**.\n\n` +
-          `⏱️ Checking every ~${checkMin} min · 🔒 ${CONFIRMATION_NEEDED}× confirmation required before alert`
-        )
+        .setDescription(`**@${username}** is currently **LIVE** on Instagram.\n\nYou'll be notified the moment this account gets **banned or deactivated**.\n\n⏱️ Checking every ~${checkMin} min · 🔒 ${CONFIRMATION_NEEDED}× confirmation required before alert`)
         .addFields(
           { name: "🎯 Target",         value: `[@${username}](https://instagram.com/${username})`, inline: true },
           { name: "📊 Current Status", value: "🟢 LIVE / ACCESSIBLE",                             inline: true },
@@ -592,18 +468,14 @@ client.on(Events.InteractionCreate, async (interaction) => {
           { name: "🔔 Watching For",   value: "Ban / Deletion / Deactivation",                    inline: false },
           ...buildProfileFields(firstCheck.profile, "📸 Current Profile Stats"),
         )
-        .setFooter({ text: "Instagram Monitor v6 • Monitoring Base" })
+        .setFooter({ text: "Instagram Monitor v9 • Monitoring Base" })
         .setTimestamp();
     } else {
       embed = new EmbedBuilder()
         .setColor(0xff4444)
         .setTitle("🔴  Account Is Banned — Monitoring for Recovery")
         .setThumbnail(picUrl)
-        .setDescription(
-          `**@${username}** is currently **BANNED** on Instagram.\n\n` +
-          `You'll be notified the moment this account gets **un-banned or recovered**.\n\n` +
-          `⏱️ Checking every ~${checkMin} min · 🔒 ${CONFIRMATION_NEEDED}× confirmation required before alert`
-        )
+        .setDescription(`**@${username}** is currently **BANNED** on Instagram.\n\nYou'll be notified the moment this account gets **un-banned or recovered**.\n\n⏱️ Checking every ~${checkMin} min · 🔒 ${CONFIRMATION_NEEDED}× confirmation required before alert`)
         .addFields(
           { name: "🎯 Client Account", value: `[@${username}](https://instagram.com/${username})`, inline: true },
           { name: "📊 Current Status", value: "🔴 BANNED",                                        inline: true },
@@ -611,36 +483,21 @@ client.on(Events.InteractionCreate, async (interaction) => {
           { name: "🔔 Watching For",   value: "Unban / Account Recovery",                         inline: false },
           { name: "📸 Profile Stats",  value: "_Not available — account is currently banned._",   inline: false },
         )
-        .setFooter({ text: "Instagram Monitor v6 • Monitoring Base" })
+        .setFooter({ text: "Instagram Monitor v9 • Monitoring Base" })
         .setTimestamp();
     }
-
-    await adminLog({
-      type: "COMMAND", title: `/monitor add — @${username}`,
-      color: mode === "WATCH_FOR_BAN" ? 0x00cc55 : 0xff4444,
-      description:
-        `<@${interaction.user.id}> added \`@${username}\` to Monitoring Base.\n\n` +
-        `**Mode:** ${modeText}\n` +
-        `**Initial status:** ${firstCheck.status}\n` +
-        `**Check method:** ${firstCheck.method ?? "unknown"}\n` +
-        `**Slots used:** ${monitoringBase.activeCount()}/${MAX_ACTIVE}`,
-      user: interaction.user, guild: logCtx,
-      fields: buildProfileFields(firstCheck.profile, "📸 Profile Stats at Add Time"),
-    });
 
     return interaction.editReply({ embeds: [embed] });
   }
 
-  // ── /monitor list ──────────────────────────────────────────────────────
   if (sub === "list") {
     if (!permissions.canViewList(interaction.user.id)) {
-      return interaction.reply({ content: "🔒 You don't have permission. Ask the owner to run `/monitor grant @you`.", ephemeral: true });
+      return interaction.reply({ content: "🔒 You don't have permission. Ask the owner to run `/monitor grant @you`.", flags: 64 });
     }
 
     const active = monitoringBase.listActive();
-
     if (!active.length) {
-      return interaction.reply({ content: "📭 No accounts are currently being monitored. Use `/monitor add <username>` to get started.", ephemeral: true });
+      return interaction.reply({ content: "📭 No accounts are currently being monitored. Use `/monitor add <username>` to get started.", flags: 64 });
     }
 
     const watchingBan   = active.filter((a) => a.mode === "WATCH_FOR_BAN");
@@ -650,11 +507,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
     const embed = new EmbedBuilder()
       .setColor(0x5865f2)
       .setTitle("📡  Active Monitoring List")
-      .setDescription(
-        `**${active.length}** account(s) being watched — **${active.length}/${MAX_ACTIVE}** slots used.\n` +
-        `Check interval: ~${checkMin} min · Confirmation: ${CONFIRMATION_NEEDED}× required`
-      )
-      .setFooter({ text: "Instagram Monitor v6 • Active Only" })
+      .setDescription(`**${active.length}** account(s) being watched — **${active.length}/${MAX_ACTIVE}** slots used.\nCheck interval: ~${checkMin} min · Confirmation: ${CONFIRMATION_NEEDED}× required`)
+      .setFooter({ text: "Instagram Monitor v9 • Active Only" })
       .setTimestamp();
 
     if (watchingBan.length) {
@@ -676,27 +530,19 @@ client.on(Events.InteractionCreate, async (interaction) => {
       });
     }
 
-    await adminLog({
-      type: "COMMAND", title: "/monitor list",
-      description: `<@${interaction.user.id}> viewed the list. Active: ${active.length}/${MAX_ACTIVE}`,
-      user: interaction.user, guild: logCtx,
-    });
-
-    return interaction.reply({ embeds: [embed], ephemeral: true });
+    return interaction.reply({ embeds: [embed], flags: 64 });
   }
 
-  // ── /monitor status ────────────────────────────────────────────────────
   if (sub === "status") {
-    if (!username) return interaction.reply({ content: "❌ Please provide an Instagram username.", ephemeral: true });
+    if (!username) return interaction.reply({ content: "❌ Please provide an Instagram username.", flags: 64 });
 
     const account = monitoringBase.get(username);
     if (!account) {
-      return interaction.reply({ content: `❌ **@${username}** is not in the active Monitoring Base.`, ephemeral: true });
+      return interaction.reply({ content: `❌ **@${username}** is not in the active Monitoring Base.`, flags: 64 });
     }
 
-    await interaction.deferReply({ ephemeral: true });
+    await interaction.deferReply({ flags: 64 });
 
-    // One-shot check for /status — no confirmation needed, just show truth right now
     const result = await checkAccountOnce(username);
     monitoringBase.update(username, {
       lastChecked: result.checkedAt.toISOString(),
@@ -717,36 +563,28 @@ client.on(Events.InteractionCreate, async (interaction) => {
       .setTitle(`📊 Status Check — @${username}`)
       .setThumbnail(picUrl)
       .addFields(
-        { name: "📊 Current Status", value: `${sEmoji[result.status] || "⏳"} ${result.status}`, inline: true  },
-        { name: "🎯 Monitor Mode",   value: modeLabel,                                            inline: true  },
-        { name: "👤 Added By",       value: updated.addedBy,                                      inline: true  },
-        { name: "🔢 Total Checks",   value: updated.checkCount.toLocaleString(),                  inline: true  },
-        { name: "📅 Added",          value: tsField(updated.addedAt),                             inline: true  },
-        { name: "🕐 Last Checked",   value: tsField(updated.lastChecked),                         inline: true  },
-        { name: "⚙️ Check Interval", value: `~${checkMin} min (${CONFIRMATION_NEEDED}× confirm)`, inline: true  },
+        { name: "📊 Current Status", value: `${sEmoji[result.status] || "⏳"} ${result.status}`, inline: true },
+        { name: "🎯 Monitor Mode",   value: modeLabel,                                            inline: true },
+        { name: "👤 Added By",       value: updated.addedBy,                                      inline: true },
+        { name: "🔢 Total Checks",   value: updated.checkCount.toLocaleString(),                  inline: true },
+        { name: "📅 Added",          value: tsField(updated.addedAt),                             inline: true },
+        { name: "🕐 Last Checked",   value: tsField(updated.lastChecked),                         inline: true },
+        { name: "⚙️ Check Interval", value: `~${checkMin} min (${CONFIRMATION_NEEDED}× confirm)`, inline: true },
         { name: "🔍 Detail",         value: result.detail,                                        inline: false },
         ...buildProfileFields(updated.cachedProfile, "📸 Profile Stats"),
       )
-      .setFooter({ text: "Instagram Monitor v6 • Live Check" })
+      .setFooter({ text: "Instagram Monitor v9 • Live Check" })
       .setTimestamp();
-
-    await adminLog({
-      type: "COMMAND", title: `/monitor status — @${username}`,
-      description: `<@${interaction.user.id}> ran status check on \`@${username}\`. Result: ${result.status}`,
-      color, user: interaction.user, guild: logCtx,
-      fields: buildProfileFields(updated.cachedProfile, "📸 Profile Stats"),
-    });
 
     return interaction.editReply({ embeds: [embed] });
   }
 
-  // ── /monitor remove ────────────────────────────────────────────────────
   if (sub === "remove") {
-    if (!username) return interaction.reply({ content: "❌ Please provide an Instagram username.", ephemeral: true });
+    if (!username) return interaction.reply({ content: "❌ Please provide an Instagram username.", flags: 64 });
 
     const account = monitoringBase.get(username);
     if (!account) {
-      return interaction.reply({ content: `❌ **@${username}** is not in the active Monitoring Base.`, ephemeral: true });
+      return interaction.reply({ content: `❌ **@${username}** is not in the active Monitoring Base.`, flags: 64 });
     }
 
     archiveAndStop(username, "MANUALLY_REMOVED");
@@ -760,20 +598,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
         { name: "📅 Was Added On", value: tsField(account.addedAt), inline: true },
         { name: "🔢 Total Checks", value: `${account.checkCount}`,  inline: true },
       )
-      .setFooter({ text: "Instagram Monitor v6 • Archived to Old Clients" })
+      .setFooter({ text: "Instagram Monitor v9 • Archived to Old Clients" })
       .setTimestamp();
 
-    await adminLog({
-      type: "COMMAND", title: `/monitor remove — @${username}`,
-      color: 0x888888,
-      description:
-        `<@${interaction.user.id}> removed \`@${username}\` from Monitoring Base.\n` +
-        `**Originally added by:** ${account.addedBy}\n` +
-        `**Total checks:** ${account.checkCount.toLocaleString()}`,
-      user: interaction.user, guild: logCtx,
-    });
-
-    return interaction.reply({ embeds: [embed], ephemeral: true });
+    return interaction.reply({ embeds: [embed], flags: 64 });
   }
 });
 
@@ -785,8 +613,7 @@ client.once(Events.ClientReady, async () => {
   console.log(`⏱️  Check interval       : ${Math.round(BASE_INTERVAL_MS / 1000)}s (~${Math.round(BASE_INTERVAL_MS / 60000)} min)`);
   console.log(`✅  Confirmations needed : ${CONFIRMATION_NEEDED}x`);
   console.log(`🔐 Admin log channel    : ${LOG_CHANNEL_ID ?? "NOT SET (disabled)"}`);
-  console.log(`🍪 IG Cookies          : ${[process.env.IG_COOKIE_1, process.env.IG_COOKIE_2].filter(Boolean).length} configured`);
-  console.log(`🌐 Proxy                : ${process.env.PROXY_URL    ? "configured ✅" : "not set"}\n`);
+  console.log(`🔑 RapidAPI Key        : ${process.env.RAPIDAPI_KEY ? "configured ✅" : "NOT SET ⚠️"}\n`);
   await registerCommands();
   resumeAll();
   console.log("🤖 Bot is running. Use /monitor in Discord.\n");
